@@ -126,15 +126,15 @@ def sample_igpu_freq():
 def sample_top_procs():
     try:
         out = subprocess.run(
-            ["ps", "-eo", "%mem,%cpu,comm", "--sort=-%mem", "--no-headers"],
+            ["ps", "-eo", "pid,%mem,%cpu,comm", "--sort=-%mem", "--no-headers"],
             capture_output=True, text=True, timeout=3
         )
         procs = []
         for line in out.stdout.strip().split("\n")[:6]:
-            parts = line.strip().split(None, 2)
-            if len(parts) == 3:
-                mem, cpu, name = parts
-                procs.append((name, float(mem), float(cpu)))
+            parts = line.strip().split(None, 3)
+            if len(parts) == 4:
+                pid, mem, cpu, name = parts
+                procs.append((int(pid), name, float(mem), float(cpu)))
         return procs
     except Exception:
         return []
@@ -238,6 +238,16 @@ CSS = """
 }
 .header-btn:hover { background-color: #313244; }
 .pin-active { background-color: #89b4fa; color: #1e1e2e; }
+.proc-row {
+    border-radius: 6px; padding: 4px 8px;
+}
+.proc-row:hover { background-color: #313244; }
+.proc-kill-btn {
+    min-width: 24px; min-height: 24px; padding: 0; margin: 0;
+    border-radius: 6px;
+    color: #f38ba8;
+}
+.proc-kill-btn:hover { background-color: #f38ba8; color: #1e1e2e; }
 """
 
 
@@ -419,6 +429,17 @@ class Dashboard(Adw.Application):
             GLib.source_remove(self._timeout_id)
         self.quit()
 
+    def _kill_proc(self, btn, pid, name):
+        try:
+            os.kill(pid, 15)  # SIGTERM
+            if self.debug:
+                print(f"killed pid {pid} ({name})", file=sys.stderr)
+        except ProcessLookupError:
+            pass  # already gone
+        except PermissionError:
+            # Try via pkexec for root-owned processes
+            subprocess.Popen(["pkexec", "kill", "-15", str(pid)])
+
     def _build_mem_section(self, box):
         self._section_title(box, "Memory / Pressure")
         self._metric_row(box, "RAM available", "mem_pct")
@@ -510,15 +531,25 @@ class Dashboard(Adw.Application):
         pbox = self._widgets["proc_box"]
         while pbox.get_first_child() is not None:
             pbox.remove(pbox.get_first_child())
-        for name, mem, cpu in s.top_procs:
+        for pid, name, mem, cpu in s.top_procs:
             row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-            n = Gtk.Label(label=name, xalign=0)
+            row.set_css_classes(["proc-row"])
+
+            n = Gtk.Label(label=f"{name}", xalign=0)
             n.set_css_classes(["proc-name"])
             n.set_hexpand(True)
             m = Gtk.Label(label=f"mem {mem:.1f}%  cpu {cpu:.1f}%", xalign=1)
             m.set_css_classes(["proc-num"])
+
+            kill_btn = Gtk.Button()
+            kill_btn.set_icon_name("user-trash-symbolic")
+            kill_btn.set_tooltip_text(f"Kill {name} (PID {pid})")
+            kill_btn.set_css_classes(["proc-kill-btn"])
+            kill_btn.connect("clicked", self._kill_proc, pid, name)
+
             row.append(n)
             row.append(m)
+            row.append(kill_btn)
             pbox.append(row)
 
         # Return True so timeout_add_seconds keeps firing every interval

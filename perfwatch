@@ -222,6 +222,16 @@ CSS = """
 .proc-num    { color: #a6adc8; font-family: monospace; font-size: 9pt; }
 .log-line    { color: #a6adc8; font-family: monospace; font-size: 8pt; }
 .log-empty   { color: #585b70; font-style: italic; font-size: 9pt; }
+.header-bar {
+    background-color: #313244;
+    border-radius: 8px;
+    padding: 6px 10px;
+    margin-bottom: 8px;
+}
+.header-title {
+    font-weight: bold; font-size: 12pt;
+    color: #f5f5f5;
+}
 .header-btn {
     min-width: 28px; min-height: 28px; padding: 2px; margin: 0;
     border-radius: 6px;
@@ -367,11 +377,11 @@ class Dashboard(Adw.Application):
         handle = Gtk.WindowHandle()
 
         header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        header.set_margin_bottom(4)
+        header.set_css_classes(["header-bar"])
 
         title = Gtk.Label(xalign=0)
         title.set_markup("<b>perfwatch</b>  <small>performance dashboard</small>")
-        title.set_css_classes(["section-title"])
+        title.set_css_classes(["header-title"])
         title.set_hexpand(True)
 
         # Pin (always on top) toggle button

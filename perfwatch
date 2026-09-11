@@ -28,13 +28,12 @@ from collections import deque
 import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Gtk, Adw, GLib, Gio
+from gi.repository import Gtk, Adw, GLib, Gio, Gdk
 
-# GNOME/Mutter doesn't support wlr-layer-shell, so we use the built-in
-# toggle-above keybinding + ydotool to trigger it on the focused window.
-# Keycodes from linux/input-event-codes.h: LEFTCTRL=29 LEFTALT=56 F9=67
-TOGGLE_ABOVE_KEYBIND = "<Control><Alt>F9"
-YDOTOOL_KEYS = "29:1 56:1 67:1 67:0 56:0 29:0"
+# GNOME/Mutter doesn't support wlr-layer-shell, so always-on-top is done
+# via GNOME Shell's DBus Eval interface (no synthetic keypresses, no
+# ydotool, no stuck modifiers).
+# The JS snippet calls _toggleAbove on the focused window's Meta.Window.
 
 
 # --- data sampling ----------------------------------------------------------
@@ -301,7 +300,6 @@ class Dashboard(Adw.Application):
         self._pinned = False
         self._timeout_id = None
         self._win = None
-        self._orig_keybind = None
 
     def do_activate(self):
         self._build_window()
@@ -349,26 +347,6 @@ class Dashboard(Adw.Application):
         scrolled.set_child(main_box)
         win.set_content(scrolled)
         win.present()
-
-        # Set up toggle-above keybinding (save original for restore on quit)
-        if self._orig_keybind is None:
-            try:
-                r = subprocess.run(
-                    ["gsettings", "get", "org.gnome.desktop.wm.keybindings",
-                     "toggle-above"],
-                    capture_output=True, text=True, timeout=2
-                )
-                self._orig_keybind = r.stdout.strip()
-            except Exception:
-                self._orig_keybind = "@as []"
-            try:
-                subprocess.run(
-                    ["gsettings", "set", "org.gnome.desktop.wm.keybindings",
-                     "toggle-above", f"['{TOGGLE_ABOVE_KEYBIND}']"],
-                    timeout=2
-                )
-            except Exception:
-                pass
 
         # Start refresh timer
         self._refresh()
@@ -431,30 +409,35 @@ class Dashboard(Adw.Application):
             btn.add_css_class("pin-active")
         else:
             btn.remove_css_class("pin-active")
-        # Window is focused (user just clicked the button), so send
-        # the toggle-above keybinding via ydotool. Mutter applies it
-        # to the focused window (perfwatch).
+        # Call the perfwatch-above GNOME Shell extension via DBus.
+        # The extension calls Meta.Window.make_above()/unmake_above() on
+        # the window matching this title. Requires the extension to be
+        # enabled (needs session restart after first install).
         try:
-            subprocess.Popen(["ydotool", "key", YDOTOOL_KEYS])
-        except Exception:
-            pass
+            r = subprocess.run(
+                ["gdbus", "call", "--session", "--dest", "dev.chard.Perfwatch",
+                 "--object-path", "/dev/chard/Perfwatch",
+                 "--method", "dev.chard.Perfwatch.ToggleAbove", "perfwatch"],
+                capture_output=True, text=True, timeout=3
+            )
+            if r.returncode != 0:
+                btn.set_tooltip_text(
+                    "Always-on-top needs perfwatch-above extension.\n"
+                    "Log out and back in to activate it.")
+                if self.debug:
+                    print(f"pin dbus failed: {r.stderr.strip()}", file=sys.stderr)
+            else:
+                btn.set_tooltip_text("Always on top")
+                if self.debug:
+                    print(f"pin dbus: {r.stdout.strip()}", file=sys.stderr)
+        except Exception as e:
+            if self.debug:
+                print(f"pin failed: {e}", file=sys.stderr)
 
     def _on_close(self, btn):
-        self._restore_keybind()
+        if self._timeout_id is not None:
+            GLib.source_remove(self._timeout_id)
         self.quit()
-
-    def _restore_keybind(self):
-        """Restore original toggle-above keybinding."""
-        if self._orig_keybind is not None:
-            try:
-                subprocess.run(
-                    ["gsettings", "set", "org.gnome.desktop.wm.keybindings",
-                     "toggle-above", self._orig_keybind],
-                    timeout=2
-                )
-            except Exception:
-                pass
-            self._orig_keybind = None
 
     def _kill_proc(self, btn, pid, name):
         try:

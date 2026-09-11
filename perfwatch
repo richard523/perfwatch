@@ -1,0 +1,446 @@
+#!/usr/bin/env python3
+"""perfwatch — extremely light GTK4 performance dashboard.
+
+Aggregates the things that kill performance on this machine into one window:
+  - Memory / swap / PSI pressure
+  - OOM kill log (earlyoom + systemd-oomd)
+  - Audio xruns (from audiowatch journal)
+  - CPU load / frequency / thermal / throttle
+  - iGPU frequency / temperature
+
+Data sources: /proc, /sys, journalctl. No daemon, no dependencies beyond
+python-gobject + gtk4 (already installed). ~15MB resident.
+
+Usage:
+  perfwatch                 # default 2s refresh
+  perfwatch --interval 5    # 5s refresh
+  perfwatch --debug          # also print samples to stdout
+"""
+
+import argparse
+import subprocess
+import os
+import sys
+import time
+from dataclasses import dataclass, field
+from collections import deque
+
+import gi
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Gtk, Adw, GLib, Gio
+
+
+# --- data sampling ----------------------------------------------------------
+
+@dataclass
+class Sample:
+    ts: float = 0.0
+    mem_total: int = 0
+    mem_avail: int = 0
+    swap_total: int = 0
+    swap_free: int = 0
+    psi_some_avg10: float = 0.0
+    psi_full_avg10: float = 0.0
+    load1: float = 0.0
+    load5: float = 0.0
+    cpu_freq_mhz: int = 0
+    cpu_max_freq_mhz: int = 0
+    cpu_temp: int = 0
+    pkg_temp: int = 0
+    dgpu_temp: int = 0
+    igpu_freq_mhz: int = 0
+    top_procs: list = field(default_factory=list)
+    oom_kills: list = field(default_factory=list)
+    xrun_events: list = field(default_factory=list)
+
+
+def _read_int(path):
+    try:
+        with open(path) as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return 0
+
+
+def sample_mem():
+    vals = {}
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                parts = line.split(":")
+                if len(parts) >= 2:
+                    vals[parts[0].strip()] = int(parts[1].split()[0])
+    except (OSError, ValueError):
+        pass
+    return vals
+
+
+def sample_psi():
+    some, full = 0.0, 0.0
+    try:
+        with open("/proc/pressure/memory") as f:
+            for line in f:
+                if line.startswith("some"):
+                    some = float(line.split("avg10=")[1].split()[0])
+                elif line.startswith("full"):
+                    full = float(line.split("avg10=")[1].split()[0])
+    except (OSError, ValueError, IndexError):
+        pass
+    return some, full
+
+
+def sample_loadavg():
+    try:
+        with open("/proc/loadavg") as f:
+            parts = f.read().split()
+            return float(parts[0]), float(parts[1])
+    except (OSError, ValueError):
+        return 0.0, 0.0
+
+
+def sample_cpu_freq():
+    cur = _read_int("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq")
+    mx = _read_int("/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq")
+    return cur // 1000, mx // 1000
+
+
+def sample_thermal():
+    cpu = _read_int("/sys/class/thermal/thermal_zone3/temp") // 1000
+    pkg = _read_int("/sys/class/thermal/thermal_zone4/temp") // 1000
+    dgpu = _read_int("/sys/class/thermal/thermal_zone1/temp") // 1000
+    return cpu, pkg, dgpu
+
+
+def sample_igpu_freq():
+    return _read_int("/sys/class/drm/card1-eDP-1/device/gt_act_freq_mhz")
+
+
+def sample_top_procs():
+    try:
+        out = subprocess.run(
+            ["ps", "-eo", "%mem,%cpu,comm", "--sort=-%mem", "--no-headers"],
+            capture_output=True, text=True, timeout=3
+        )
+        procs = []
+        for line in out.stdout.strip().split("\n")[:6]:
+            parts = line.strip().split(None, 2)
+            if len(parts) == 3:
+                mem, cpu, name = parts
+                procs.append((name, float(mem), float(cpu)))
+        return procs
+    except Exception:
+        return []
+
+
+def sample_oom_kills():
+    kills = []
+    try:
+        out = subprocess.run(
+            ["journalctl", "-u", "earlyoom", "--since", "1 hour ago",
+             "--no-pager", "-g", "Killing|sending SIG|Low memory|oom-kill"],
+            capture_output=True, text=True, timeout=4
+        )
+        for line in out.stdout.strip().split("\n"):
+            if line.strip():
+                kills.append(line.strip())
+    except Exception:
+        pass
+    try:
+        out = subprocess.run(
+            ["journalctl", "--user", "-u", "systemd-oomd", "--since", "1 day ago",
+             "--no-pager"],
+            capture_output=True, text=True, timeout=4
+        )
+        for line in out.stdout.strip().split("\n"):
+            if "killed" in line.lower() or "chose" in line.lower():
+                kills.append(line.strip())
+    except Exception:
+        pass
+    return kills[-10:]
+
+
+def sample_xrun_events():
+    events = []
+    try:
+        out = subprocess.run(
+            ["journalctl", "--user", "-t", "audiowatch", "--since", "1 hour ago",
+             "--no-pager"],
+            capture_output=True, text=True, timeout=4
+        )
+        for line in out.stdout.strip().split("\n"):
+            if line.strip():
+                events.append(line.strip())
+    except Exception:
+        pass
+    return events[-10:]
+
+
+def take_sample():
+    s = Sample(ts=time.time())
+    mem = sample_mem()
+    s.mem_total = mem.get("MemTotal", 1)
+    s.mem_avail = mem.get("MemAvailable", 0)
+    s.swap_total = mem.get("SwapTotal", 0)
+    s.swap_free = mem.get("SwapFree", 0)
+    s.psi_some_avg10, s.psi_full_avg10 = sample_psi()
+    s.load1, s.load5 = sample_loadavg()
+    s.cpu_freq_mhz, s.cpu_max_freq_mhz = sample_cpu_freq()
+    s.cpu_temp, s.pkg_temp, s.dgpu_temp = sample_thermal()
+    s.igpu_freq_mhz = sample_igpu_freq()
+    s.top_procs = sample_top_procs()
+    s.oom_kills = sample_oom_kills()
+    s.xrun_events = sample_xrun_events()
+    return s
+
+
+# --- UI ---------------------------------------------------------------------
+
+CSS = """
+.perfwatch-bg { background-color: #1e1e2e; }
+.section-title {
+    font-weight: bold; font-size: 11pt;
+    color: #cdd6f4; margin-top: 8px; margin-bottom: 4px;
+}
+.metric-label { color: #a6adc8; font-size: 9pt; }
+.metric-value { color: #cdd6f4; font-size: 11pt; font-family: monospace; }
+.metric-warn { color: #f9e2af; }
+.metric-crit { color: #f38ba8; font-weight: bold; }
+.metric-ok   { color: #a6e3a1; }
+.bar-trough  { background-color: #313244; border-radius: 3px; }
+.bar-fill    { border-radius: 3px; }
+.bar-mem     { background-color: #89b4fa; }
+.bar-swap    { background-color: #f5c2e7; }
+.proc-name   { color: #cdd6f4; font-family: monospace; font-size: 9pt; }
+.proc-num    { color: #a6adc8; font-family: monospace; font-size: 9pt; }
+.log-line    { color: #a6adc8; font-family: monospace; font-size: 8pt; }
+.log-empty   { color: #585b70; font-style: italic; font-size: 9pt; }
+"""
+
+
+def pct_label(pct, warn=30, crit=15):
+    if pct < crit:
+        return f"{pct:.0f}%", "metric-crit"
+    elif pct < warn:
+        return f"{pct:.0f}%", "metric-warn"
+    return f"{pct:.0f}%", "metric-ok"
+
+
+def temp_label(temp, warn=80, crit=90):
+    if temp >= crit:
+        return f"{temp}C", "metric-crit"
+    elif temp >= warn:
+        return f"{temp}C", "metric-warn"
+    return f"{temp}C", "metric-ok"
+
+
+def psi_label(val, warn=5.0, crit=10.0):
+    if val >= crit:
+        return f"{val:.1f}%", "metric-crit"
+    elif val >= warn:
+        return f"{val:.1f}%", "metric-warn"
+    return f"{val:.1f}%", "metric-ok"
+
+
+class Bar(Gtk.Box):
+    def __init__(self, fill_class, width=200, height=14):
+        super().__init__(orientation=Gtk.Orientation.HORIZONTAL)
+        self.set_css_classes(["bar-trough"])
+        self.set_size_request(width, height)
+        self._fill = Gtk.Box()
+        self._fill.set_css_classes(["bar-fill", fill_class])
+        self._fill.set_size_request(0, height)
+        self.append(self._fill)
+        self._w = width
+        self._h = height
+
+    def set_pct(self, pct):
+        pct = max(0, min(100, pct))
+        self._fill.set_size_request(int(self._w * pct / 100), self._h)
+
+
+class Dashboard(Adw.Application):
+    def __init__(self, interval=2, debug=False):
+        super().__init__(application_id="dev.chard.perfwatch")
+        self.interval = interval
+        self.debug = debug
+        self.history = deque(maxlen=60)
+        self._widgets = {}
+
+    def do_activate(self):
+        win = Adw.ApplicationWindow(application=self)
+        win.set_title("perfwatch")
+        win.set_default_size(520, 720)
+        win.set_icon_name("perfwatch")
+
+        provider = Gtk.CssProvider()
+        provider.load_from_string(CSS)
+        Gtk.StyleContext.add_provider_for_display(
+            win.get_display(), provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_vexpand(True)
+        main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        main_box.set_margin_start(16)
+        main_box.set_margin_end(16)
+        main_box.set_margin_top(12)
+        main_box.set_margin_bottom(12)
+        main_box.set_css_classes(["perfwatch-bg"])
+
+        self._build_header(main_box)
+        self._build_mem_section(main_box)
+        self._build_cpu_section(main_box)
+        self._build_audio_section(main_box)
+        self._build_oom_section(main_box)
+        self._build_procs_section(main_box)
+
+        scrolled.set_child(main_box)
+        win.set_content(scrolled)
+        win.present()
+
+        GLib.timeout_add_seconds(self.interval, self._refresh)
+
+    def _section_title(self, box, title):
+        lbl = Gtk.Label(label=title, xalign=0)
+        lbl.set_css_classes(["section-title"])
+        box.append(lbl)
+
+    def _metric_row(self, box, label_text, key):
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        row.set_margin_bottom(2)
+        lbl = Gtk.Label(label=label_text, xalign=0)
+        lbl.set_css_classes(["metric-label"])
+        lbl.set_hexpand(True)
+        val = Gtk.Label(label="--", xalign=1)
+        val.set_css_classes(["metric-value"])
+        row.append(lbl)
+        row.append(val)
+        box.append(row)
+        self._widgets[key] = val
+
+    def _build_header(self, box):
+        title = Gtk.Label(xalign=0)
+        title.set_markup("<b>perfwatch</b>  <small>performance dashboard</small>")
+        title.set_css_classes(["section-title"])
+        box.append(title)
+
+    def _build_mem_section(self, box):
+        self._section_title(box, "Memory / Pressure")
+        self._metric_row(box, "RAM available", "mem_pct")
+        self._widgets["mem_bar"] = Bar("bar-mem")
+        box.append(self._widgets["mem_bar"])
+        self._metric_row(box, "Swap free", "swap_pct")
+        self._widgets["swap_bar"] = Bar("bar-swap")
+        box.append(self._widgets["swap_bar"])
+        self._metric_row(box, "PSI some (avg10)", "psi_some")
+        self._metric_row(box, "PSI full (avg10)", "psi_full")
+
+    def _build_cpu_section(self, box):
+        self._section_title(box, "CPU / Thermal")
+        self._metric_row(box, "Load (1m / 5m)", "load")
+        self._metric_row(box, "CPU freq", "cpu_freq")
+        self._metric_row(box, "CPU temp", "cpu_temp")
+        self._metric_row(box, "Package temp", "pkg_temp")
+        self._metric_row(box, "dGPU temp", "dgpu_temp")
+        self._metric_row(box, "iGPU freq", "igpu_freq")
+
+    def _build_audio_section(self, box):
+        self._section_title(box, "Audio Xruns (last 1h)")
+        self._widgets["xrun_box"] = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+        box.append(self._widgets["xrun_box"])
+
+    def _build_oom_section(self, box):
+        self._section_title(box, "OOM Kills (last 1h)")
+        self._widgets["oom_box"] = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+        box.append(self._widgets["oom_box"])
+
+    def _build_procs_section(self, box):
+        self._section_title(box, "Top Processes")
+        self._widgets["proc_box"] = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+        box.append(self._widgets["proc_box"])
+
+    def _set_val(self, key, text, css_class=None):
+        w = self._widgets.get(key)
+        if w and isinstance(w, Gtk.Label):
+            w.set_text(text)
+            if css_class:
+                for c in ("metric-ok", "metric-warn", "metric-crit"):
+                    w.remove_css_class(c)
+                w.add_css_class(css_class)
+
+    def _update_log_box(self, box, lines, empty_msg):
+        while box.get_first_child() is not None:
+            box.remove(box.get_first_child())
+        if not lines:
+            lbl = Gtk.Label(label=empty_msg, xalign=0)
+            lbl.set_css_classes(["log-empty"])
+            box.append(lbl)
+        else:
+            for line in lines[-8:]:
+                lbl = Gtk.Label(label=line, xalign=0, wrap=True)
+                lbl.set_css_classes(["log-line"])
+                box.append(lbl)
+
+    def _refresh(self):
+        s = take_sample()
+        self.history.append(s)
+        if self.debug:
+            print(f"[{s.ts:.0f}] RAM {s.mem_avail*100//max(s.mem_total,1)}% "
+                  f"swap {s.swap_free*100//max(s.swap_total,1)}% "
+                  f"PSI {s.psi_some_avg10:.1f}/{s.psi_full_avg10:.1f} "
+                  f"CPU {s.cpu_freq_mhz}MHz {s.cpu_temp}C", file=sys.stderr)
+
+        mem_pct = s.mem_avail * 100 / max(s.mem_total, 1)
+        swap_pct = s.swap_free * 100 / max(s.swap_total, 1) if s.swap_total > 0 else 100.0
+        self._set_val("mem_pct", *pct_label(mem_pct))
+        self._widgets["mem_bar"].set_pct(100 - mem_pct)
+        self._set_val("swap_pct", *pct_label(swap_pct))
+        self._widgets["swap_bar"].set_pct(100 - swap_pct)
+
+        self._set_val("psi_some", *psi_label(s.psi_some_avg10))
+        self._set_val("psi_full", *psi_label(s.psi_full_avg10, warn=2.0, crit=5.0))
+
+        self._set_val("load", f"{s.load1:.2f} / {s.load5:.2f}")
+        self._set_val("cpu_freq", f"{s.cpu_freq_mhz} / {s.cpu_max_freq_mhz} MHz")
+        self._set_val("cpu_temp", *temp_label(s.cpu_temp))
+        self._set_val("pkg_temp", *temp_label(s.pkg_temp))
+        self._set_val("dgpu_temp", *temp_label(s.dgpu_temp, warn=60, crit=75))
+        self._set_val("igpu_freq", f"{s.igpu_freq_mhz} MHz")
+
+        self._update_log_box(self._widgets["xrun_box"], s.xrun_events, "No xrun events")
+        self._update_log_box(self._widgets["oom_box"], s.oom_kills, "No OOM kills")
+
+        pbox = self._widgets["proc_box"]
+        while pbox.get_first_child() is not None:
+            pbox.remove(pbox.get_first_child())
+        for name, mem, cpu in s.top_procs:
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            n = Gtk.Label(label=name, xalign=0)
+            n.set_css_classes(["proc-name"])
+            n.set_hexpand(True)
+            m = Gtk.Label(label=f"mem {mem:.1f}%  cpu {cpu:.1f}%", xalign=1)
+            m.set_css_classes(["proc-num"])
+            row.append(n)
+            row.append(m)
+            pbox.append(row)
+
+        # Return True so timeout_add_seconds keeps firing every interval
+        return True
+
+
+def main():
+    parser = argparse.ArgumentParser(description="perfwatch -- light performance dashboard")
+    parser.add_argument("--interval", type=int, default=2, help="refresh interval in seconds")
+    parser.add_argument("--debug", action="store_true", help="print samples to stderr")
+    args = parser.parse_args()
+
+    app = Dashboard(interval=args.interval, debug=args.debug)
+    # Strip our flags so Gtk doesn't choke on them
+    clean_argv = [sys.argv[0]]
+    app.run(clean_argv)
+
+
+if __name__ == "__main__":
+    main()

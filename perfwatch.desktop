@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=perfwatch
+Comment=Lightweight performance dashboard
+Exec=/home/chardlinux/Development/random/perfwatch/perfwatch
+Icon=perfwatch
+Terminal=false
+Categories=System;Monitor;
+Keywords=performance;memory;cpu;oom;audio;
+StartupNotify=true

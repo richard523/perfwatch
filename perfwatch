@@ -30,6 +30,13 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Gtk, Adw, GLib, Gio
 
+try:
+    gi.require_version("Gtk4LayerShell", "1.0")
+    from gi.repository import Gtk4LayerShell as LayerShell
+    HAS_LAYER_SHELL = True
+except (ImportError, ValueError):
+    HAS_LAYER_SHELL = False
+
 
 # --- data sampling ----------------------------------------------------------
 
@@ -215,6 +222,12 @@ CSS = """
 .proc-num    { color: #a6adc8; font-family: monospace; font-size: 9pt; }
 .log-line    { color: #a6adc8; font-family: monospace; font-size: 8pt; }
 .log-empty   { color: #585b70; font-style: italic; font-size: 9pt; }
+.header-btn {
+    min-width: 28px; min-height: 28px; padding: 2px; margin: 0;
+    border-radius: 6px;
+}
+.header-btn:hover { background-color: #313244; }
+.pin-active { background-color: #89b4fa; color: #1e1e2e; }
 """
 
 
@@ -266,12 +279,39 @@ class Dashboard(Adw.Application):
         self.debug = debug
         self.history = deque(maxlen=60)
         self._widgets = {}
+        self._pinned = False
+        self._timeout_id = None
+        self._win = None
 
     def do_activate(self):
+        self._build_window()
+
+    def _build_window(self):
+        # Cancel old timeout before rebuilding
+        if self._timeout_id is not None:
+            GLib.source_remove(self._timeout_id)
+            self._timeout_id = None
+
+        # Destroy old window if it exists
+        if self._win is not None:
+            self._win.destroy()
+            self._widgets = {}
+
         win = Adw.ApplicationWindow(application=self)
         win.set_title("perfwatch")
         win.set_default_size(520, 720)
         win.set_icon_name("perfwatch")
+        self._win = win
+
+        # Apply layer-shell if pinned (always on top)
+        if self._pinned and HAS_LAYER_SHELL:
+            LayerShell.init_for_window(win)
+            LayerShell.set_layer(win, LayerShell.Layer.TOP)
+            LayerShell.set_keyboard_mode(win, LayerShell.KeyboardMode.NONE)
+            # No anchors = free-floating, user can position via margins
+            for edge in (LayerShell.Edge.LEFT, LayerShell.Edge.RIGHT,
+                         LayerShell.Edge.TOP, LayerShell.Edge.BOTTOM):
+                LayerShell.set_anchor(win, edge, False)
 
         provider = Gtk.CssProvider()
         provider.load_from_string(CSS)
@@ -300,7 +340,9 @@ class Dashboard(Adw.Application):
         win.set_content(scrolled)
         win.present()
 
-        GLib.timeout_add_seconds(self.interval, self._refresh)
+        # Start refresh timer
+        self._refresh()
+        self._timeout_id = GLib.timeout_add_seconds(self.interval, self._refresh)
 
     def _section_title(self, box, title):
         lbl = Gtk.Label(label=title, xalign=0)
@@ -321,10 +363,51 @@ class Dashboard(Adw.Application):
         self._widgets[key] = val
 
     def _build_header(self, box):
+        # WindowHandle makes the header draggable to move the window
+        handle = Gtk.WindowHandle()
+
+        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        header.set_margin_bottom(4)
+
         title = Gtk.Label(xalign=0)
         title.set_markup("<b>perfwatch</b>  <small>performance dashboard</small>")
         title.set_css_classes(["section-title"])
-        box.append(title)
+        title.set_hexpand(True)
+
+        # Pin (always on top) toggle button
+        pin_btn = Gtk.ToggleButton()
+        pin_btn.set_icon_name("view-pin-symbolic")
+        pin_btn.set_tooltip_text("Always on top")
+        pin_btn.set_css_classes(["header-btn"])
+        pin_btn.set_active(self._pinned)
+        pin_btn.connect("toggled", self._toggle_pin)
+        if self._pinned:
+            pin_btn.add_css_class("pin-active")
+
+        # Close button
+        close_btn = Gtk.Button()
+        close_btn.set_icon_name("window-close-symbolic")
+        close_btn.set_tooltip_text("Close")
+        close_btn.set_css_classes(["header-btn"])
+        close_btn.connect("clicked", self._on_close)
+
+        header.append(title)
+        header.append(pin_btn)
+        header.append(close_btn)
+        handle.set_child(header)
+        box.append(handle)
+
+    def _toggle_pin(self, btn):
+        self._pinned = btn.get_active()
+        if not HAS_LAYER_SHELL:
+            return  # no-op on unsupported platforms
+        # Rebuild window with/without layer-shell
+        self._build_window()
+
+    def _on_close(self, btn):
+        if self._timeout_id is not None:
+            GLib.source_remove(self._timeout_id)
+        self.quit()
 
     def _build_mem_section(self, box):
         self._section_title(box, "Memory / Pressure")
@@ -384,6 +467,8 @@ class Dashboard(Adw.Application):
                 box.append(lbl)
 
     def _refresh(self):
+        if self._win is None or not self._widgets:
+            return True
         s = take_sample()
         self.history.append(s)
         if self.debug:

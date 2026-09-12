@@ -424,7 +424,12 @@ class Dashboard(Adw.Application):
                 btn.set_tooltip_text("Always-on-top needs GNOME Shell extension")
                 return
             # Parse the unique name from "(':1.X',)"
-            unique_name = owner.stdout.strip().strip("()").strip("'").rstrip(",").strip()
+            import re as _re
+            m = _re.search(r"'([^']+)'", owner.stdout)
+            if not m:
+                btn.set_tooltip_text("Could not find GNOME Shell bus name")
+                return
+            unique_name = m.group(1)
             method = "dev.chard.Pwtop.Pin" if self._pinned else "dev.chard.Pwtop.Unpin"
             r = subprocess.run(
                 ["gdbus", "call", "--session", "--dest", unique_name,

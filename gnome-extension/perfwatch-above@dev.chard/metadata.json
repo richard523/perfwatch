@@ -1,7 +1,0 @@
-{
-  "uuid": "perfwatch-above@dev.chard",
-  "name": "Perfwatch Always-On-Top",
-  "description": "DBus method to toggle always-on-top for perfwatch window",
-  "shell-version": ["50", "51", "52"],
-  "version": 1
-}

@@ -1,0 +1,7 @@
+{
+  "uuid": "pwtop@dev.chard",
+  "name": "Perfwatch Top",
+  "description": "Always-on-top for perfwatch",
+  "shell-version": ["50"],
+  "version": 1
+}

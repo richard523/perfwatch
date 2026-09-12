@@ -1,7 +1,0 @@
-{
-  "uuid": "perfwatch-pin@dev.chard",
-  "name": "Perfwatch Pin",
-  "description": "Always-on-top toggle for perfwatch window",
-  "shell-version": ["50"],
-  "version": 1
-}

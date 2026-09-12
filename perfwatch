@@ -425,11 +425,11 @@ class Dashboard(Adw.Application):
                 return
             # Parse the unique name from "(':1.X',)"
             unique_name = owner.stdout.strip().strip("()").strip("'").rstrip(",").strip()
+            method = "dev.chard.Pwtop.Pin" if self._pinned else "dev.chard.Pwtop.Unpin"
             r = subprocess.run(
                 ["gdbus", "call", "--session", "--dest", unique_name,
-                 "--object-path", "/dev/chard/Pin",
-                 "--method", "dev.chard.Pin.SetAbove",
-                 "perfwatch", "true" if self._pinned else "false"],
+                 "--object-path", "/dev/chard/Pwtop",
+                 "--method", method, "perfwatch"],
                 capture_output=True, text=True, timeout=3
             )
             if r.returncode != 0:

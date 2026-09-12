@@ -429,7 +429,7 @@ class Dashboard(Adw.Application):
             r = subprocess.run(
                 ["gdbus", "call", "--session", "--dest", unique_name,
                  "--object-path", "/dev/chard/Pwtop",
-                 "--method", method, "perfwatch"],
+                 "--method", method, "dev.chard.perfwatch"],
                 capture_output=True, text=True, timeout=3
             )
             if r.returncode != 0:

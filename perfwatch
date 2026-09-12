@@ -428,7 +428,8 @@ class Dashboard(Adw.Application):
             r = subprocess.run(
                 ["gdbus", "call", "--session", "--dest", unique_name,
                  "--object-path", "/dev/chard/Perfwatch",
-                 "--method", "dev.chard.Perfwatch.ToggleAbove", "perfwatch"],
+                 "--method", "dev.chard.Perfwatch.SetAbove",
+                 "perfwatch", "true" if self._pinned else "false"],
                 capture_output=True, text=True, timeout=3
             )
             if r.returncode != 0:

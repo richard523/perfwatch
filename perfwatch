@@ -410,20 +410,29 @@ class Dashboard(Adw.Application):
         else:
             btn.remove_css_class("pin-active")
         # Call the perfwatch-above GNOME Shell extension via DBus.
-        # The extension calls Meta.Window.make_above()/unmake_above() on
-        # the window matching this title. Requires the extension to be
-        # enabled (needs session restart after first install).
+        # The extension exports at /dev/chard/Perfwatch on GNOME Shell's
+        # unique bus name. We look up the owner of org.gnome.Shell first.
         try:
+            # Get GNOME Shell's unique bus name
+            owner = subprocess.run(
+                ["gdbus", "call", "--session", "--dest", "org.freedesktop.DBus",
+                 "--object-path", "/org/freedesktop/DBus",
+                 "--method", "org.freedesktop.DBus.GetNameOwner", "org.gnome.Shell"],
+                capture_output=True, text=True, timeout=2
+            )
+            if owner.returncode != 0:
+                btn.set_tooltip_text("Always-on-top needs GNOME Shell extension")
+                return
+            # Parse the unique name from "(':1.X',)"
+            unique_name = owner.stdout.strip().strip("()").strip("'").rstrip(",").strip()
             r = subprocess.run(
-                ["gdbus", "call", "--session", "--dest", "dev.chard.Perfwatch",
+                ["gdbus", "call", "--session", "--dest", unique_name,
                  "--object-path", "/dev/chard/Perfwatch",
                  "--method", "dev.chard.Perfwatch.ToggleAbove", "perfwatch"],
                 capture_output=True, text=True, timeout=3
             )
             if r.returncode != 0:
-                btn.set_tooltip_text(
-                    "Always-on-top needs perfwatch-above extension.\n"
-                    "Log out and back in to activate it.")
+                btn.set_tooltip_text("Extension not loaded. Log out/back in.")
                 if self.debug:
                     print(f"pin dbus failed: {r.stderr.strip()}", file=sys.stderr)
             else:
